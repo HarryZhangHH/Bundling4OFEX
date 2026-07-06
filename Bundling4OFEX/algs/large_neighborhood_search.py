@@ -33,15 +33,18 @@ def insert_nodes(path, pickup, delivery):
             new_paths.append(path[:i] + [pickup] + path[i:j] + [delivery] + path[j:])
     return new_paths
 
-def calculate_prob(rev_list):
-    if len(rev_list) == 1:
-        return [1]
-    
-    rev_array = np.array(rev_list)
-    max_rev   = np.max(rev_array)
-    delta_rev = max_rev - rev_array
+def calculate_prob(rev_list, temperature=1.0):
+    rev_array = np.asarray(rev_list, dtype=np.float64)
 
-    prob = delta_rev / (np.sum(delta_rev))
+    if len(rev_array) == 1:
+        return np.array([1.0])
+
+    scaled = rev_array / max(temperature, 1e-12)
+    scaled = scaled - np.max(scaled)
+
+    prob = np.exp(scaled)
+    prob = prob / np.sum(prob)
+
     return prob
 
 def repair(route, positions, loads, revenues, Q_max, T_max, R, D, device, obj='revenue', stochastic=False):
@@ -98,7 +101,12 @@ def repair(route, positions, loads, revenues, Q_max, T_max, R, D, device, obj='r
 
     # 4) pick the best (or sample if stochastic)
     if len(valid_route) > 0:
-        idx_choice = (np.random.choice(len(valid_route), p=calculate_prob(rev_list)) if stochastic else int(np.argmax(rev_list)))
+        # idx_choice = (np.random.choice(len(valid_route), p=calculate_prob(rev_list)) if stochastic else int(np.argmax(rev_list)))
+        idx_choice = (
+            np.random.choice(len(valid_route), p=calculate_prob(rev_list, temperature=0.2))
+            if stochastic
+            else int(np.argmax(rev_list))
+        )
         chosen = valid_route[idx_choice]
     else:
         chosen = route  # no improvement found
@@ -106,14 +114,13 @@ def repair(route, positions, loads, revenues, Q_max, T_max, R, D, device, obj='r
     assert chosen[-1] == D-1, chosen
     return chosen
 
-def hill_climb(routes, depots, requests, stochastic=False, obj='revenue', seed=1234):
+def hill_climb(routes, depots, requests, stochastic=False, obj='revenue'):
     """
     routes: (B, L) long tensor of node‐indices 0..(N−1),  
             but after the first time we hit `end_idx` it is
             “padding” (all subsequent positions are also end_idx).
     We want to treat each tour as “real” up to the first end_idx, then ignore the padding.
     """
-    seed_everything(seed)
     device = depots.device
     B, R, D = requests.size(0), requests.size(1), depots.size(1)
     N = D + 2*R   # total number of nodes
@@ -124,8 +131,6 @@ def hill_climb(routes, depots, requests, stochastic=False, obj='revenue', seed=1
 
     update_routes = []
     for b in range(B):
-        seed_everything(seed)
-        
         new_route = routes[b]
         old_route = []
         while old_route != new_route:
