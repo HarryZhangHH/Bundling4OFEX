@@ -6,148 +6,168 @@ import math
 
 from utils.pdp_functions import *
 
-# def greedy_pdp(depots, requests):
-#     """
-#     Greedy PDP that uses your build_pdp_graph & mask_pdp unchanged.
-    
-#     Inpicts
-#     ------
-#       depots    : (1,2,4) tensor  [[x,y,Q_max,T_max] for start/end]
-#       requests  : (1,R,6) tensor  [[px,py,dx,dy,load,revenue]]
-#     Returns
-#     -------
-#       route     : list of node-indices visited (0=start,1=end,2.. pickups,2+R.. deliveries)
-#       total_T   : float total distance
-#     """
-#     # unpack sizes
-#     device   = depots.device
-#     R        = requests.size(1)
-#     N        = 2 + 2*R
 
-#     # state (batch size = 1 assumed)
-#     mask     = torch.zeros(1, N, dtype=torch.bool, device=device)
-#     vis_node= torch.zeros_like(mask)
-#     undel    = torch.zeros(1, R, dtype=torch.bool, device=device)
-#     current  = torch.zeros(1, 1, dtype=torch.long, device=device)  # start=0
-#     Q        = torch.zeros(1, 1,device=device)
-#     T        = torch.zeros(1, 1,device=device)
-#     route    = [0]
+def construct_cpdp(depots, requests, method="greedy", precise=True, seed=1234):
+    """
+    Unified batched constructive heuristic for CPDP.
 
-#     # pre-extract Q_max, T_max, end coords as numpy
-#     Q_max = torch.tensor(depots[0,0,2].item(),device=device).view(1,1,1)
-#     T_max = torch.tensor(depots[0,0,3].item(),device=device).view(1,1,1)
-#     # convert depot coords to numpy for build_pdp_graph:
-#     end_xy_np = depots[0,1,:2].cpic().numpy()
+    Supported methods
+    -----------------
+      - "greedy"  : choose feasible node with max (revenue - distance)
+      - "random"  : randomly choose a feasible non-end node
+      - "nearest" : choose nearest feasible non-end node
 
-#     while True:
-#         # 1) update mask
-#         mask, vis_node = mask_pdp(
-#             mask, vis_node,
-#             depots, requests,
-#             current, undel, Q, T, bsz=1
-#         )
-#         print(mask)
+    Inputs
+    ------
+      depots    : (B,2,4) tensor  [[x,y,Q_max,T_max] for start,end]
+      requests  : (B,R,6) tensor  [[px,py,dx,dy,load,revenue]]
 
-#         # 2) list feasible nodes
-#         feasible = (~mask[0]).nonzero(as_tuple=True)[0].cpic().tolist()
-#         print(feasible)
-#         if not feasible:
-#             break
+    Returns
+    -------
+      routes  : list of length B, each a Python list of node-indices visited
+      L       : (B,) float tensor of total travelled distance per example
+    """
+    assert method in {"greedy", "random", "nearest"}, f"Unknown method: {method}"
 
-#         # 3) current (x,y) in numpy
-#         # build positions tensor once
-#         coords_depots     = depots[:, :2, :2]       # (1,2,2)
-#         coords_pickups    = requests[:, :, :2]      # (1,R,2)
-#         coords_deliveries = requests[:, :, 2:4]     # (1,R,2)
-#         positions  = torch.cat([coords_depots, coords_pickups, coords_deliveries], dim=1)
-#         pos_xy     = positions[0].cpic().numpy()         # (N,2)
-#         current_i  = current.item()
-#         current_xy = pos_xy[current_i]
+    seed_everything(seed)
+    device = depots.device
+    B, R_req, D = requests.size(0), requests.size(1), depots.size(1)
+    N = D + 2 * R_req
+    zero_to_bsz = torch.arange(B, device=device)
+    end_idx = D - 1
 
-#         best_cost = float('inf')
-#         best_revenue = -float('inf')
-#         best_i    = None
+    # State
+    mask     = torch.zeros(B, N, dtype=torch.bool, device=device)
+    vis_node = torch.zeros_like(mask)
+    undel    = torch.zeros(B, R_req, dtype=torch.bool, device=device)
+    current  = torch.zeros(B, dtype=torch.long, device=device)   # start depot index = 0
+    Q        = torch.zeros(B, 1, device=device)
+    T        = torch.zeros(B, 1, device=device)
 
-#         # 4) evaluate each candidate
-#         for i in feasible:
-#             dist = T.clone()
-#             # only allow end=1 if all deliveries done
-#             if i==1 and undel.any():
-#                 continue
+    # Static data
+    positions, loads, revenues, Q_max, T_max = preprocess_data(depots, requests)
 
-#             # a) direct leg cost
-#             next_xy = pos_xy[i]
-#             dist += np.hypot(current_xy[0]-next_xy[0], current_xy[1]-next_xy[1])
+    dist_matrix = torch.stack(
+        [torch.cdist(positions[b], positions[b]) for b in range(B)],
+        dim=0
+    )  # (B,N,N)
 
-#             # b) build small graph for the future leg:
-#             #    from next_xy → all pending deliveries (in undel) → end_xy_np
-#             #    we pass only the coords of still-pending deliveries
-#             undel_idxs = undel[0].nonzero(as_tuple=True)[0].cpic().tolist()
-#             # if we just picked up a new pickup, add its paired delivery
-#             if 2 <= i < 2+R:
-#                 j = i-2
-#                 if not undel[0,j]:
-#                     undel_idxs.append(j)
-#             undel_coords = np.stack([requests[0,j,2:4].cpic().numpy() for j in undel_idxs], axis=0) \
-#                            if undel_idxs else np.zeros((0,2))
-#             # note: build_pdp_graph expects: (current,end,undel_coords)
-#             G = build_pdp_graph(next_xy, end_xy_np, undel_coords)
+    routes = [[0] for _ in range(B)]
 
-#             # c) shortest‐path cost from node 0→1 in G
-#             if i != 1:
-#                 try:
-#                     dist += nx.dijkstra_path_length(G, source=0, target=1, weight='weight')
-#                 except nx.NetworkXNoPath:
-#                     print("error")
-#                     continue  # infeasible future 
-                
-#             revenue = dist.item()
-#             if 2 <= i < 2+R:
-#                 revenue += 1/2 * requests[0,i-2,5]
-#             elif i >= 2+R:
-#                 revenue += 1/2 * requests[0,i-2-R,5]
-            
-#             if revenue > best_revenue:
-#                 best_cost, best_revenue, best_i = dist.item(), revenue, i
+    while True:
+        # 1) update feasibility mask
+        mask, vis_node, path = mask_cpdp(
+            mask, vis_node,
+            depots, requests,
+            current.view(B, 1),
+            undel,
+            Q.view(B, 1),
+            T.view(B, 1),
+            positions, Q_max, T_max,
+            dist_matrix,
+            precise
+        )
 
-#         print(best_i)
+        # 2) current-to-all distances
+        dists = dist_matrix[zero_to_bsz, current, :]   # (B,N)
 
-#         # 5) if none feasible, bail out
-#         if best_i is None:
-#             break
+        # default choice: end depot
+        best_i = torch.full((B,), end_idx, dtype=torch.long, device=device)
 
-#         # 6) commit to best_i
-#         # update T
-#         # but T currently is shape (1,1,1) so:
-#         T -= best_cost
+        if method == "greedy":
+            profits = revenues.view(B, N) - dists
+            profits_masked = profits.clone()
 
-#         # update Q or undel and vis_node
-#         if 2 <= best_i < 2+R:
-#             # pickup
-#             j = best_i - 2
-#             load = requests[0,j,4].item()
-#             undel[0,j] = True
-#         elif best_i >= 2+R:
-#             # delivery
-#             j = best_i - (2+R)
-#             load = - requests[0,j,4].item()
-#             undel[0,j] = False
-#         else: 
-#             load = 0
-         
-#         Q += load
-#         vis_node[0,best_i] = True
-#         mask[0,best_i] = True
+            # mask infeasible nodes
+            profits_masked = profits_masked.masked_fill(mask, -float('inf'))
 
-#         current = torch.tensor([best_i], device=device)
-#         route.append(best_i)
+            # do not choose end depot early if there are feasible non-end nodes
+            profits_no_end = profits_masked.clone()
+            profits_no_end[:, end_idx] = -float('inf')
 
-#         # stop if we reached the end depot
-#         if best_i == 1:
-#             print(best_i)
-#             break
-#     return route, T.item()
+            best_non_end_val, best_non_end_i = profits_no_end.max(dim=1)
 
+            has_non_end = ~torch.isinf(best_non_end_val)
+            best_i[has_non_end] = best_non_end_i[has_non_end]
+            best_i[~has_non_end] = end_idx
+
+        elif method == "nearest":
+            dists_masked = dists.clone()
+            dists_masked = dists_masked.masked_fill(mask, float('inf'))
+
+            # do not choose end depot early if there are feasible non-end nodes
+            dists_no_end = dists_masked.clone()
+            dists_no_end[:, end_idx] = float('inf')
+
+            best_non_end_val, best_non_end_i = dists_no_end.min(dim=1)
+
+            has_non_end = ~torch.isinf(best_non_end_val)
+            best_i[has_non_end] = best_non_end_i[has_non_end]
+            best_i[~has_non_end] = end_idx
+
+        elif method == "random":
+            for b in range(B):
+                if current[b].item() == end_idx:
+                    best_i[b] = end_idx
+                    continue
+
+                feasible = (~mask[b]).nonzero(as_tuple=False).squeeze(-1)
+
+                if feasible.numel() == 0:
+                    best_i[b] = end_idx
+                    continue
+
+                feasible_non_end = feasible[feasible != end_idx]
+
+                if feasible_non_end.numel() > 0:
+                    rand_pos = torch.randint(
+                        low=0,
+                        high=feasible_non_end.numel(),
+                        size=(1,),
+                        device=device
+                    ).item()
+                    best_i[b] = feasible_non_end[rand_pos]
+                else:
+                    best_i[b] = end_idx
+
+        # keep samples already at end depot fixed there
+        best_i[current == end_idx] = end_idx
+
+        # 3) transition cost
+        best_cost = dist_matrix[zero_to_bsz, current, best_i]  # (B,)
+
+        # 4) update load
+        Q += loads[zero_to_bsz, best_i].view(B, 1)
+
+        # 5a) pickups
+        pic_mask = (best_i >= D) & (best_i < D + R_req)
+        if pic_mask.any():
+            pic_idx = best_i[pic_mask] - D
+            undel[pic_mask, pic_idx] = True
+
+        # 5b) deliveries
+        del_mask = (best_i >= D + R_req)
+        if del_mask.any():
+            del_idx = best_i[del_mask] - D - R_req
+            undel[del_mask, del_idx] = False
+
+        # 5c) record visited
+        vis_node[zero_to_bsz, best_i] = True
+
+        # 6) append routes
+        for b in range(B):
+            routes[b].append(best_i[b].item())
+
+        # 7) update time and current node
+        T[:, 0] += best_cost
+        current = best_i
+
+        # 8) terminate when all are at end depot
+        if (current == end_idx).all():
+            break
+
+    L = compute_route_length(routes, positions)
+    return routes, L
 
 def greedy_cpdp(depots, requests, precise=True, seed=1234):
     """
